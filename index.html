@@ -1,0 +1,440 @@
+<!DOCTYPE html>
+<html lang="ru">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Мой GPS-навигатор</title>
+
+  <link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css">
+
+  <style>
+    body { margin: 0; font-family: Arial, sans-serif; }
+    #map { height: 70vh; width: 100%; }
+    .panel {
+      padding: 8px 10px;
+      display: flex;
+      flex-wrap: wrap;
+      gap: 8px;
+      align-items: center;
+      background: #f4f4f4;
+      border-bottom: 1px solid #ccc;
+      font-size: 14px;
+    }
+    .panel button {
+      padding: 7px 11px;
+      cursor: pointer;
+      border: 1px solid #888;
+      border-radius: 6px;
+      background: #fff;
+    }
+    .panel button:hover { background: #e8e8e8; }
+    .panel select, .panel label, .panel input[type="text"] { font-size: 14px; }
+    .panel input[type="text"] {
+      padding: 7px 9px;
+      border: 1px solid #888;
+      border-radius: 6px;
+      min-width: 220px;
+    }
+    .line-group {
+      display: flex;
+      align-items: center;
+      gap: 4px;
+      border: 1px solid #bbb;
+      border-radius: 6px;
+      padding: 2px 6px;
+      background: #fff;
+    }
+    .search-group {
+      display: flex;
+      align-items: center;
+      gap: 4px;
+    }
+    #status { padding: 6px 10px; font-size: 14px; color: #333; }
+    #log {
+      max-height: 10vh;
+      overflow-y: auto;
+      margin: 0;
+      padding: 6px 10px 6px 30px;
+      font-size: 12px;
+      background: #f0f7ff;
+      border-top: 1px solid #cce;
+      font-family: monospace;
+    }
+    #points {
+      max-height: 12vh;
+      overflow-y: auto;
+      margin: 0;
+      padding: 8px 10px 8px 30px;
+      font-size: 13px;
+      background: #fafafa;
+      border-top: 1px solid #ccc;
+    }
+    #points li { cursor: pointer; margin: 2px 0; }
+    #points li:hover { text-decoration: underline; }
+  </style>
+</head>
+<body>
+
+  <div class="panel">
+    <button onclick="findMe()">📍 Моё местоположение</button>
+    <button onclick="toggleWatch()" id="watchBtn">▶ Следить за мной</button>
+    <button onclick="clearAll()">🗑 Очистить всё</button>
+
+    <div class="line-group">
+      <button onclick="drawLine()">📏 Линия</button>
+      <select id="lineMode" title="Режим линии" onchange="onModeChange()">
+        <option value="last">Последние две</option>
+        <option value="chain">Цепочка (авто)</option>
+        <option value="all">Паутинка (авто)</option>
+      </select>
+    </div>
+
+    <div class="search-group">
+      <input type="text" id="addressInput" placeholder="Введите адрес..."
+             onkeydown="if(event.key==='Enter') searchAddress()">
+      <button onclick="searchAddress()">🔍 Найти</button>
+    </div>
+
+    <label>
+      <input type="checkbox" id="logDistances"> Лог дистанций
+    </label>
+  </div>
+
+  <div id="status">Нажми кнопку, чтобы определить координаты. Shift + колесо — медленный зум.</div>
+  <div id="map"></div>
+  <ul id="log"></ul>
+  <ul id="points"></ul>
+
+  <script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script>
+  <script>
+    // ---------- Карта ----------
+    const map = L.map('map').setView([52.3676, 4.9041], 13);
+    map.attributionControl.setPrefix(false);
+    L.tileLayer('https://tile.openstreetmap.org/{z}/{x}/{y}.png', {
+      maxZoom: 19,
+    }).addTo(map);
+
+    // ---------- Медленный зум по Shift + колесо ----------
+    const mapEl = document.getElementById('map');
+    mapEl.addEventListener('wheel', function (e) {
+      if (!e.shiftKey) return;
+      e.preventDefault();
+      e.stopPropagation();
+      if (e.deltaY < 0) {
+        map.setZoom(map.getZoom() + 0.2, { animate: true });
+      } else {
+        map.setZoom(map.getZoom() - 0.2, { animate: true });
+      }
+    }, { passive: false });
+
+    // ---------- Состояние ----------
+    let markers = [];
+    let points = [];
+    let watchId = null;
+    let meMarker = null;
+    let lineLayers = [];
+    let lineIndexOffset = 0;
+
+    const STORAGE_KEY = 'gps_points_v1';
+
+    // Кэш поиска: адрес -> {lat, lon, display_name}
+    const geocodeCache = new Map();
+
+    // ---------- localStorage ----------
+    function savePoints() {
+      localStorage.setItem(STORAGE_KEY, JSON.stringify(points));
+    }
+    function loadPoints() {
+      const raw = localStorage.getItem(STORAGE_KEY);
+      if (!raw) return;
+      try { points = JSON.parse(raw); } catch (e) { points = []; return; }
+      points.forEach(p => addMarker(p.lat, p.lon, false));
+      renderList();
+    }
+
+    // ---------- Нормализация координат ----------
+    function normalize(lat, lng) {
+      let lon = ((lng + 180) % 360 + 360) % 360 - 180;
+      let la = Math.max(-90, Math.min(90, lat));
+      return { lat: la, lon: lon };
+    }
+
+    // ---------- Маркеры ----------
+    function addMarker(lat, lon, save = true) {
+      if (save) {
+        const n = normalize(lat, lon);
+        lat = n.lat;
+        lon = n.lon;
+      }
+      const marker = L.marker([lat, lon]).addTo(map)
+        .bindPopup('Координаты: ' + lat.toFixed(5) + ', ' + lon.toFixed(5));
+      markers.push(marker);
+
+      if (save) {
+        points.push({ lat, lon });
+        savePoints();
+        renderList();
+        lineIndexOffset = 0;
+
+        const mode = document.getElementById('lineMode').value;
+        if (mode === 'chain' && points.length > 1) drawChainSegment();
+        if (mode === 'all' && points.length > 1) drawAllSegments();
+      }
+      return marker;
+    }
+
+    // ---------- Список точек ----------
+    function renderList() {
+      const ul = document.getElementById('points');
+      ul.innerHTML = '';
+      points.forEach((p, i) => {
+        const li = document.createElement('li');
+        li.textContent = `${i + 1}: ${p.lat.toFixed(5)}, ${p.lon.toFixed(5)}`;
+        li.onclick = () => map.setView([p.lat, p.lon], 16);
+        ul.appendChild(li);
+      });
+    }
+
+    // ---------- Лог ----------
+    function addLog(text) {
+      const ul = document.getElementById('log');
+      const li = document.createElement('li');
+      li.textContent = text;
+      ul.appendChild(li);
+      ul.scrollTop = ul.scrollHeight;
+    }
+    function clearLog() {
+      document.getElementById('log').innerHTML = '';
+    }
+
+    // ---------- Смена режима ----------
+    function onModeChange() {
+      lineIndexOffset = 0;
+      const mode = document.getElementById('lineMode').value;
+      if (mode === 'last') setStatus('Режим: последние две. Кнопка "Линия" листает назад.');
+      if (mode === 'chain') setStatus('Режим: цепочка. Новые точки соединяются с предыдущей.');
+      if (mode === 'all') setStatus('Режим: паутинка. Новые точки соединяются со всеми.');
+    }
+
+    // ---------- Клик по карте ----------
+    map.on('click', function (e) {
+      addMarker(e.latlng.lat, e.latlng.lng, true);
+    });
+
+    // ---------- Геолокация ----------
+    function findMe() {
+      if (!navigator.geolocation) {
+        setStatus('Геолокация не поддерживается');
+        return;
+      }
+      navigator.geolocation.getCurrentPosition(
+        function (pos) {
+          const lat = pos.coords.latitude;
+          const lon = pos.coords.longitude;
+          const accuracy = pos.coords.accuracy;
+          setStatus(`Широта: ${lat.toFixed(6)}, долгота: ${lon.toFixed(6)}, погрешность: ${Math.round(accuracy)} м`);
+          if (meMarker) map.removeLayer(meMarker);
+          meMarker = L.marker([lat, lon]).addTo(map)
+            .bindPopup('Вы находитесь здесь').openPopup();
+          map.setView([lat, lon], 16);
+        },
+        function (err) { setStatus('Не удалось получить координаты: ' + err.message); },
+        { enableHighAccuracy: true, timeout: 15000, maximumAge: 0 }
+      );
+    }
+
+    function toggleWatch() {
+      const btn = document.getElementById('watchBtn');
+      if (watchId !== null) {
+        navigator.geolocation.clearWatch(watchId);
+        watchId = null;
+        btn.textContent = '▶ Следить за мной';
+        setStatus('Слежение остановлено');
+        return;
+      }
+      if (!navigator.geolocation) { setStatus('Геолокация не поддерживается'); return; }
+
+      watchId = navigator.geolocation.watchPosition(
+        function (pos) {
+          const lat = pos.coords.latitude;
+          const lon = pos.coords.longitude;
+          const accuracy = pos.coords.accuracy;
+          setStatus(`Слежение: ${lat.toFixed(6)}, ${lon.toFixed(6)}, погрешность: ${Math.round(accuracy)} м`);
+          if (meMarker) meMarker.setLatLng([lat, lon]);
+          else meMarker = L.marker([lat, lon]).addTo(map).bindPopup('Вы находитесь здесь');
+          map.setView([lat, lon]);
+        },
+        function (err) { setStatus('Ошибка слежения: ' + err.message); },
+        { enableHighAccuracy: true, timeout: 15000, maximumAge: 0 }
+      );
+      btn.textContent = '⏸ Остановить слежение';
+    }
+
+    // ---------- Очистка ----------
+    function clearAll() {
+      markers.forEach(m => map.removeLayer(m));
+      markers = [];
+      points = [];
+      savePoints();
+      renderList();
+      lineLayers.forEach(l => map.removeLayer(l));
+      lineLayers = [];
+      lineIndexOffset = 0;
+      if (meMarker) { map.removeLayer(meMarker); meMarker = null; }
+      clearLog();
+      setStatus('Всё очищено');
+    }
+
+    // ---------- Кнопка "Линия" ----------
+    function drawLine() {
+      const mode = document.getElementById('lineMode').value;
+      const logOn = document.getElementById('logDistances').checked;
+
+      if (mode === 'chain') { drawChainSegment(); return; }
+      if (mode === 'all') { drawAllSegments(); return; }
+
+      if (points.length < 2) { setStatus('Нужно минимум 2 точки'); return; }
+
+      const n = points.length;
+      const bIdx = n - 1 - lineIndexOffset;
+      const aIdx = bIdx - 1;
+      if (aIdx < 0) {
+        lineIndexOffset = 0;
+        setStatus('Дошли до начала. Сброс на последние две.');
+        return;
+      }
+
+      lineLayers.forEach(l => map.removeLayer(l));
+      lineLayers = [];
+
+      const a = points[aIdx], b = points[bIdx];
+      const poly = L.polyline([[a.lat, a.lon], [b.lat, b.lon]], { color: 'blue', weight: 3 }).addTo(map);
+      lineLayers.push(poly);
+      const d = distance(a.lat, a.lon, b.lat, b.lon);
+      setStatus(`Линия ${aIdx + 1}→${bIdx + 1}. Расстояние: ${d.toFixed(1)} м`);
+      if (logOn) addLog(`${aIdx + 1}→${bIdx + 1}: ${d.toFixed(1)} м`);
+      lineIndexOffset++;
+    }
+
+    // ---------- Авто "Цепочка" ----------
+    function drawChainSegment() {
+      if (points.length < 2) { setStatus('Нужно минимум 2 точки'); return; }
+      const a = points[points.length - 2];
+      const b = points[points.length - 1];
+      const poly = L.polyline([[a.lat, a.lon], [b.lat, b.lon]], { color: 'green', weight: 3 }).addTo(map);
+      lineLayers.push(poly);
+      const d = distance(a.lat, a.lon, b.lat, b.lon);
+      if (document.getElementById('logDistances').checked) {
+        addLog(`Цепочка ${points.length - 1}→${points.length}: ${d.toFixed(1)} м`);
+      }
+      setStatus(`Цепочка: +${d.toFixed(1)} м`);
+    }
+
+    // ---------- Авто "Паутинка" ----------
+    function drawAllSegments() {
+      const n = points.length;
+      if (n < 2) { setStatus('Нужно минимум 2 точки'); return; }
+      const b = points[n - 1];
+      const logOn = document.getElementById('logDistances').checked;
+      for (let i = 0; i < n - 1; i++) {
+        const a = points[i];
+        const poly = L.polyline([[a.lat, a.lon], [b.lat, b.lon]], {
+          color: 'orange', weight: 2, opacity: 0.7
+        }).addTo(map);
+        lineLayers.push(poly);
+        const d = distance(a.lat, a.lon, b.lat, b.lon);
+        if (logOn) addLog(`Все ${i + 1}→${n}: ${d.toFixed(1)} м`);
+      }
+      setStatus(`Паутинка: точка ${n} соединена со всеми`);
+    }
+
+    // ---------- Поиск по адресу (Nominatim) ----------
+    async function searchAddress() {
+      const input = document.getElementById('addressInput');
+      const query = input.value.trim();
+      if (!query) { setStatus('Введите адрес для поиска'); return; }
+
+      if (geocodeCache.has(query)) {
+        const cached = geocodeCache.get(query);
+        applySearchResult(cached, query, true);
+        return;
+      }
+
+      setStatus('Ищу адрес...');
+
+      const url = 'https://nominatim.openstreetmap.org/search?' +
+                  'format=json&limit=1&q=' + encodeURIComponent(query);
+
+      try {
+        const res = await fetch(url, {
+          headers: { 'Accept': 'application/json' }
+        });
+        if (!res.ok) throw new Error('HTTP ' + res.status);
+        const data = await res.json();
+
+        if (!data || data.length === 0) {
+          setStatus('Адрес не найден: ' + query);
+          return;
+        }
+
+        const item = {
+          lat: parseFloat(data[0].lat),
+          lon: parseFloat(data[0].lon),
+          display_name: data[0].display_name
+        };
+        geocodeCache.set(query, item);
+        applySearchResult(item, query, false);
+      } catch (err) {
+        setStatus('Ошибка поиска: ' + err.message);
+      }
+    }
+
+    function applySearchResult(item, query, fromCache) {
+      const n = normalize(item.lat, item.lon);
+      const marker = L.marker([n.lat, n.lon]).addTo(map)
+        .bindPopup(`<b>${escapeHtml(query)}</b><br>${escapeHtml(item.display_name)}`)
+        .openPopup();
+      markers.push(marker);
+
+      points.push({ lat: n.lat, lon: n.lon });
+      savePoints();
+      renderList();
+      lineIndexOffset = 0;
+
+      const mode = document.getElementById('lineMode').value;
+      if (mode === 'chain' && points.length > 1) drawChainSegment();
+      if (mode === 'all' && points.length > 1) drawAllSegments();
+
+      map.setView([n.lat, n.lon], 16);
+      setStatus((fromCache ? 'Из кэша: ' : 'Найдено: ') + item.display_name);
+    }
+
+    function escapeHtml(s) {
+      return String(s)
+        .replace(/&/g, '&amp;').replace(/</g, '&lt;')
+        .replace(/>/g, '&gt;').replace(/"/g, '&quot;');
+    }
+
+    // ---------- Формула гаверсинусов ----------
+    function distance(lat1, lon1, lat2, lon2) {
+      const R = 6371000;
+      const toRad = d => d * Math.PI / 180;
+      const dLat = toRad(lat2 - lat1);
+      const dLon = toRad(lon2 - lon1);
+      const a = Math.sin(dLat / 2) ** 2 +
+                Math.cos(toRad(lat1)) * Math.cos(toRad(lat2)) *
+                Math.sin(dLon / 2) ** 2;
+      return 2 * R * Math.asin(Math.sqrt(a));
+    }
+
+    // ---------- Статус ----------
+    function setStatus(text) {
+      document.getElementById('status').textContent = text;
+    }
+
+    // ---------- Старт ----------
+    loadPoints();
+    onModeChange();
+  </script>
+</body>
+</html>
